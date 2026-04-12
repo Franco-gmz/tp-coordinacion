@@ -56,7 +56,7 @@ class AggregationFilter:
     def process_messsage(self, message, ack, nack):
         logging.info("Process message")
         fields = message_protocol.internal.deserialize(message)
-        if len(fields) == 2:
+        if len(fields) == 3:
             self._process_data(*fields)
         else:
             self._process_eof()

@@ -7,7 +7,7 @@ class MessageHandler:
         self.client_id = str(uuid.uuid4())
     
     def serialize_data_message(self, message):
-        [self.client_id, fruit, amount] = message
+        [fruit, amount] = message
         return message_protocol.internal.serialize([self.client_id, fruit, amount])
 
     def serialize_eof_message(self, message):
