@@ -15,4 +15,11 @@ class MessageHandler:
 
     def deserialize_result_message(self, message):
         fields = message_protocol.internal.deserialize(message)
-        return fields
+
+        client_id = fields[0]
+        fruit_top = fields[1]
+
+        if client_id != self.client_id:
+            return None
+
+        return fruit_top
