@@ -32,7 +32,7 @@ class AggregationFilter:
             self.fruit_top_by_client[client_id] = []
 
         top_fruit = self.fruit_top_by_client[client_id]
-
+        
         for i in range(len(top_fruit)):
             if top_fruit[i].fruit == fruit:
                 top_fruit[i] = top_fruit[i] + fruit_item.FruitItem(fruit, amount)

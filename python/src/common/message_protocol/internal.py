@@ -1,6 +1,5 @@
 import json
 
-
 def serialize(message):
     return json.dumps(message).encode("utf-8")
 
