@@ -29,7 +29,7 @@ class SumFilter:
         self._init_output_channel()
         self._init_local_state()
 
-        self.closed = False
+        self.shutdown = False
         signal.signal(signal.SIGTERM, self.handle_sigterm)
 
     """ 
@@ -73,27 +73,30 @@ class SumFilter:
     output connections.
     """
     def handle_sigterm(self, signum, frame):
-        logging.info("Received SIGTERM signal")
+        logging.warning("[SIGTERM] Received")
 
-        self.closed = True
+        self.shutdown = True
 
         try:
             self.input_queue.close()
         except Exception:
+            logging.exception("Error closing input queue")
             pass
 
         try:
             self.control_input.close()
         except Exception:
+            logging.exception("Error closing control input")
             pass
 
-        for control_output in self.control_outputs:
-            try:
+        try:
+            for control_output in self.control_outputs:
                 control_output.close()
-            except Exception:
-                pass
+        except Exception:
+            logging.exception("Error closing control outputs")
+            pass
 
-        self._notify_disconnect()
+        self._notify_shutdown()
 
         for data_output in self.data_outputs:
             try:
@@ -107,7 +110,7 @@ class SumFilter:
     This allows downstream workers to stop waiting for EOF messages from
     this worker and continue closing pending clients if necessary.
     """
-    def _notify_disconnect(self):
+    def _notify_shutdown(self):
         for output in self.data_outputs:
             output.send(message_protocol.internal.serialize([InternalMsgType.SUM_WORKER_SHUTDOWN.value, ID]))
 
@@ -140,7 +143,7 @@ class SumFilter:
     def process_data_messsage(self, message, ack, nack):
         
         try:
-            if self.closed:
+            if self.shutdown:
                 logging.info("Ignoring data message because worker is shutting down")
                 nack()
                 return
@@ -240,7 +243,7 @@ class SumFilter:
 
         try:
 
-            if self.closed:
+            if self.shutdown:
                 logging.info("Ignoring control message because worker is shutting down")
                 nack()
                 return

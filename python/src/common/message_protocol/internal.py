@@ -5,6 +5,7 @@ class InternalMsgType(Enum):
     CLIENT_EOF = "client_eof"
     AGGREGATOR_READY = "aggregator_ready"
     SUM_WORKER_SHUTDOWN = "sum_worker_shutdown"
+    AGG_WORKER_SHUTDOWN = "agg_worker_shutdown"
     PROCESS_DATA = "process_data"
 
 def serialize(message):

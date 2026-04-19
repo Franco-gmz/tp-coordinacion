@@ -1,8 +1,7 @@
 import os
 import logging
 import bisect
-import threading
-import hashlib
+import signal
 
 from common import middleware, message_protocol, fruit_item
 from common.message_protocol.internal import InternalMsgType
@@ -28,17 +27,52 @@ class AggregationFilter:
 
         self.input_exchange = middleware.MessageMiddlewareExchangeRabbitMQ(MOM_HOST, AGGREGATION_PREFIX, [f"{AGGREGATION_PREFIX}_{ID}"])
         self.output_queue = middleware.MessageMiddlewareQueueRabbitMQ(MOM_HOST, OUTPUT_QUEUE)
-        self.control_input = middleware.MessageMiddlewareExchangeRabbitMQ(MOM_HOST, AGG_CONTROL_EXCHANGE, [f"{AGGREGATION_PREFIX}_{ID}"])
 
         self._init_local_state()
 
-        
+        self.shutdown = False
+        signal.signal(signal.SIGTERM, self.handle_sigterm)
+
+    """
+    Initialize in-memory state used by the aggregation worker.
+
+    This includes:
+    - partial fruit totals grouped by client
+    - EOF notifications received from sum workers
+    - the current number of active sum workers expected for completion
+    """
     def _init_local_state(self):
 
         self.fruit_top_by_client = {}
         self.eof_received = {}
         self.sum_workers = SUM_AMOUNT
 
+    """
+    Gracefully handle SIGTERM shutdown requests.
+
+    The worker marks itself as shutting down and stops consuming new messages
+    from the input exchange. Pending aggregated data will be flushed the next
+    time the message loop regains control.
+    """
+    def handle_sigterm(self, signum, frame):
+        logging.warning("[SIGTERM] Received")
+        self.shutdown = True
+
+        try:
+            self.input_exchange.close()
+        except Exception:
+            logging.exception("Error closing input exchange")
+
+    """
+    Notify the downstream join stage that this aggregation worker became
+    unavailable.
+
+    This allows join to stop waiting for further messages from this worker
+    and continue completion logic with the remaining active workers.
+    """
+    def _notify_shutdown(self):
+        self.output_queue.send(message_protocol.internal.serialize([InternalMsgType.AGG_WORKER_SHUTDOWN.value, ID]))
+        
     """
     Store and accumulate fruit amounts for a given client.
 
@@ -94,7 +128,11 @@ class AggregationFilter:
         fruit_top = list(map(lambda current_fruit_item: (current_fruit_item.fruit,current_fruit_item.amount),fruits))
         logging.info(f"Sending partial top of client {client_id} from agg_{ID}")
 
-        self.output_queue.send(message_protocol.internal.serialize([client_id, fruit_top]))
+        try:
+            self.output_queue.send(message_protocol.internal.serialize([InternalMsgType.PROCESS_DATA.value, client_id, fruit_top]))
+            del self.fruit_top_by_client[client_id]
+        except Exception:
+            logging.exception(f"Error sending aggregated data for client {client_id}")
 
     """
     Notify the join stage that this aggregation worker finished processing
@@ -118,6 +156,9 @@ class AggregationFilter:
     - CLIENT_EOF: notification that a sum worker finished sending data for a client
     - SUM_WORKER_SHUTDOWN: notification that a sum worker became unavailable
 
+    If the aggregation worker is shutting down, any pending partial data is
+    flushed downstream before notifying join about the shutdown.
+
     Each message type is validated against its expected field count before
     being processed. Valid messages are acknowledged after successful
     processing. Invalid or malformed messages are rejected with nack().
@@ -125,6 +166,14 @@ class AggregationFilter:
     def process_message(self, message, ack, nack):
 
         try:
+            if self.shutdown == True:
+                for client in self.fruit_top_by_client:
+                    self._send_aggregated_data(client)
+                self._notify_shutdown()
+                self.output_queue.close()
+                logging.info("Flushed data. Shutting down...")
+                return
+
             logging.info("Process message")
             
             fields = message_protocol.internal.deserialize(message)
@@ -147,7 +196,7 @@ class AggregationFilter:
 
             elif msgtyp == InternalMsgType.SUM_WORKER_SHUTDOWN:
                 if len(fields) != SUM_SHUTDOWN_MESSAGE_FIELD_COUNT:
-                    logging.error(f"Process EOF message expects {SUM_SHUTDOWN_MESSAGE_FIELD_COUNT} fields but received {len(fields)}")
+                    logging.error(f"Process sum shutdown message expects {SUM_SHUTDOWN_MESSAGE_FIELD_COUNT} fields but received {len(fields)}")
                     nack()
                     return
                 self._handle_sum_shutdown(*fields[1:])
