@@ -33,7 +33,6 @@ class SumFilter:
             self.control_outputs.append(control_output)
 
         self.closed_clients = set()
-        self.clients_eof = {}
 
         self.data_output_exchanges = []
         for i in range(AGGREGATION_AMOUNT):
@@ -79,31 +78,21 @@ class SumFilter:
 
         self.input_queue.start_consuming(self.process_data_messsage)
 
-    def _get_client_owner(self, client_id):
-        return int(hashlib.md5(client_id.encode("utf-8")).hexdigest(), 16) % SUM_AMOUNT
-
     def _broadcast(self, msgtyp: message_protocol.internal_message.InternalMsgType, client_id):
         logging.info(f"Broadcasting control '{msgtyp.value}' for client {client_id} from sum_{ID}")
 
         for control_output in self.control_outputs:
-            control_output.send(
-                message_protocol.internal.serialize([msgtyp.value, ID, client_id])
-            )  
+            control_output.send(message_protocol.internal.serialize([msgtyp.value, ID, client_id]))  
 
     def _send_eof_to_agg(self, client_id):
 
         logging.info(f"Sending EOF for client {client_id}")
 
         for data_output_exchange in self.data_output_exchanges:
-            data_output_exchange.send(
-                message_protocol.internal.serialize([client_id])
-            )
+            data_output_exchange.send(message_protocol.internal.serialize([client_id, ID]))
 
         if client_id in self.amount_by_client:
             del self.amount_by_client[client_id]
-
-        if client_id in self.clients_eof:
-            del self.clients_eof[client_id]
 
     def _send_to_aggregate(self, client_id):
 
@@ -124,31 +113,16 @@ class SumFilter:
                     )
 
     def process_control_message(self, message, ack, nack):
-        fields = message_protocol.internal.deserialize(message)
-        msgtyp = InternalMsgType(fields[0])
 
+        fields = message_protocol.internal.deserialize(message)
+
+        msgtyp = InternalMsgType(fields[0])
+        client_id = fields[2]
+        
         if msgtyp == InternalMsgType.CLIENT_EOF:
 
-            sum_id = fields[1]
-            client_id = fields[2]
-
             self._send_to_aggregate(client_id)
-            self._broadcast(InternalMsgType.ALL_DATA_SENT_TO_AGGREGATOR, client_id)
-
-        elif msgtyp == InternalMsgType.ALL_DATA_SENT_TO_AGGREGATOR:
-
-            sum_id = fields[1]
-            client_id = fields[2]
-
-            if client_id not in self.clients_eof:
-                self.clients_eof[client_id] = set()
-            
-            self.clients_eof[client_id].add(sum_id)
-            current_count = len(self.clients_eof[client_id])
-            owner = self._get_client_owner(client_id)
-
-            if current_count == SUM_AMOUNT and owner == ID:
-                self._send_eof_to_agg(client_id)
+            self._send_eof_to_agg(client_id)
 
         ack()
 
