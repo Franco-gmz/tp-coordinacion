@@ -5,7 +5,7 @@ import threading
 import hashlib
 
 from common import middleware, message_protocol, fruit_item
-from common.message_protocol.internal_message import InternalMsgType
+from common.message_protocol.internal import InternalMsgType
 
 ID = int(os.environ["ID"])
 MOM_HOST = os.environ["MOM_HOST"]
@@ -18,72 +18,56 @@ TOP_SIZE = int(os.environ["TOP_SIZE"])
 
 AGG_CONTROL_EXCHANGE = "AGG_CONTROL_EXCHANGE"
 
+SUM_DATA_MESSAGE_FIELD_COUNT = 4
+SUM_EOF_MESSAGE_FIELD_COUNT = 3
+SUM_SHUTDOWN_MESSAGE_FIELD_COUNT = 2
 
 class AggregationFilter:
 
     def __init__(self):
-        self.input_exchange = middleware.MessageMiddlewareExchangeRabbitMQ(
-            MOM_HOST, AGGREGATION_PREFIX, [f"{AGGREGATION_PREFIX}_{ID}"]
-        )
 
-        self.output_queue = middleware.MessageMiddlewareQueueRabbitMQ(
-            MOM_HOST, OUTPUT_QUEUE
-        )
+        self.input_exchange = middleware.MessageMiddlewareExchangeRabbitMQ(MOM_HOST, AGGREGATION_PREFIX, [f"{AGGREGATION_PREFIX}_{ID}"])
+        self.output_queue = middleware.MessageMiddlewareQueueRabbitMQ(MOM_HOST, OUTPUT_QUEUE)
+        self.control_input = middleware.MessageMiddlewareExchangeRabbitMQ(MOM_HOST, AGG_CONTROL_EXCHANGE, [f"{AGGREGATION_PREFIX}_{ID}"])
 
-        self.control_input = middleware.MessageMiddlewareExchangeRabbitMQ(
-            MOM_HOST, AGG_CONTROL_EXCHANGE, [f"{AGGREGATION_PREFIX}_{ID}"]
-        )
+        self._init_local_state()
 
-        self.control_outputs = []
-        for i in range(AGGREGATION_AMOUNT):
-            control_output = middleware.MessageMiddlewareExchangeRabbitMQ(
-                MOM_HOST, AGG_CONTROL_EXCHANGE, [f"{AGGREGATION_PREFIX}_{i}"]
-            )
-            self.control_outputs.append(control_output)
+        
+    def _init_local_state(self):
 
         self.fruit_top_by_client = {}
-        self.clients_ready = {}
-        self.partial_top_sent = set()
-        self.final_eof_sent = set()
-        self.closed_clients = set()
-
         self.eof_received = {}
+        self.sum_workers = SUM_AMOUNT
 
-        self.lock = threading.RLock()
+    """
+    Store and accumulate fruit amounts for a given client.
 
-    def _get_client_owner(self, client_id):
-        return int(hashlib.md5(client_id.encode("utf-8")).hexdigest(), 16) % AGGREGATION_AMOUNT
-
-    def _broadcast(self, msgtyp: InternalMsgType, client_id):
-        logging.info(
-            f"Broadcasting control '{msgtyp.value}' for client {client_id} from aggregation_{ID}"
-        )
-
-        for control_output in self.control_outputs:
-            control_output.send(
-                message_protocol.internal.serialize([msgtyp.value, ID, client_id])
-            )
-
+    Fruit entries are kept in a sorted list so the top results can be built
+    efficiently later. If the fruit already exists for the client, its amount
+    is updated. Otherwise, a new FruitItem is inserted while preserving order.
+    """
     def _process_data(self, client_id, fruit, amount):
-        with self.lock:
-            if client_id in self.closed_clients:
+
+        if client_id not in self.fruit_top_by_client:
+            self.fruit_top_by_client[client_id] = []
+
+        top_fruit = self.fruit_top_by_client[client_id]
+
+        for i in range(len(top_fruit)):
+            if top_fruit[i].fruit == fruit:
+                top_fruit[i] = top_fruit[i] + fruit_item.FruitItem(fruit, int(amount))
                 return
 
-            #logging.info("Processing data message")
+        bisect.insort(top_fruit, fruit_item.FruitItem(fruit, int(amount)))
 
-            if client_id not in self.fruit_top_by_client:
-                self.fruit_top_by_client[client_id] = []
+    """
+    Track EOF notifications received from sum workers for a given client.
 
-            top_fruit = self.fruit_top_by_client[client_id]
-
-            for i in range(len(top_fruit)):
-                if top_fruit[i].fruit == fruit:
-                    top_fruit[i] = top_fruit[i] + fruit_item.FruitItem(fruit, int(amount))
-                    return
-
-            bisect.insort(top_fruit, fruit_item.FruitItem(fruit, int(amount)))
-
-    def _process_sum_eof(self, client_id, sum_id):
+    Once EOF has been received from all active sum workers, the aggregation
+    worker sends its partial aggregated data downstream and notifies the join
+    stage that no more data will be produced for that client.
+    """
+    def _process_eof(self, client_id, sum_id):
         logging.info(f"Received EOF from {sum_id} for client {client_id}")
 
         if client_id not in self.eof_received:
@@ -91,125 +75,110 @@ class AggregationFilter:
 
         self.eof_received[client_id].add(sum_id)
         
-        if len(self.eof_received[client_id]) == SUM_AMOUNT:
-            self._send_top(client_id)
-            self._send_eof_to_join(client_id)
+        # Use >= because a disconnected sum worker may have already sent its EOF
+        # before shutting down, leaving more EOFs than active workers.
+        if len(self.eof_received[client_id]) >= self.sum_workers:
+            self._send_aggregated_data(client_id)
+            self._close_client(client_id)
 
-    def _send_top(self, client_id):
-        with self.lock:
-            if client_id in self.partial_top_sent:
-                return
+    """
+    Send the aggregated fruit totals currently stored for a client.
 
-            self.partial_top_sent.add(client_id)
+    The generated top is partial because each aggregation worker only contains
+    a subset of the client's fruits. The join stage is responsible for merging
+    the partial tops from all aggregation workers into the final result.
+    """
+    def _send_aggregated_data(self, client_id):
 
-            fruits = self.fruit_top_by_client.get(client_id, [])
+        fruits = self.fruit_top_by_client.get(client_id, [])
+        fruit_top = list(map(lambda current_fruit_item: (current_fruit_item.fruit,current_fruit_item.amount),fruits))
+        logging.info(f"Sending partial top of client {client_id} from agg_{ID}")
 
-            #fruit_chunk = list(fruits[-TOP_SIZE:])
-            #fruit_chunk.reverse()
+        self.output_queue.send(message_protocol.internal.serialize([client_id, fruit_top]))
 
-            fruit_top = list(
-                map(
-                    lambda current_fruit_item: (
-                        current_fruit_item.fruit,
-                        current_fruit_item.amount,
-                    ),
-                    fruits,
-                )
-            )
+    """
+    Notify the join stage that this aggregation worker finished processing
+    the given client.
 
-            logging.info(f"Sending partial top for client {client_id, fruit_top}")
+    After sending the final EOF message, the local aggregation state for
+    the client is removed from memory.
+    """
+    def _close_client(self, client_id):
 
-            self.output_queue.send(
-                message_protocol.internal.serialize([client_id, fruit_top])
-            )
+        logging.info(f"Sending final EOF for client {client_id}")
+        self.output_queue.send(message_protocol.internal.serialize([InternalMsgType.CLIENT_EOF.value, client_id, ID]))
+        if client_id in self.fruit_top_by_client:
+            del self.fruit_top_by_client[client_id]
 
-    def _send_eof_to_join(self, client_id):
-        with self.lock:
-            if client_id in self.final_eof_sent:
-                return
+    """
+    Process incoming messages received from sum workers.
 
-            self.final_eof_sent.add(client_id)
-            self.closed_clients.add(client_id)
+    Supported message types include:
+    - PROCESS_DATA: aggregated fruit amounts for a client
+    - CLIENT_EOF: notification that a sum worker finished sending data for a client
+    - SUM_WORKER_SHUTDOWN: notification that a sum worker became unavailable
 
-            logging.info(f"Sending final EOF for client {client_id}")
-
-            self.output_queue.send(
-                message_protocol.internal.serialize([InternalMsgType.EOF.value, client_id, ID])
-            )
-
-            if client_id in self.fruit_top_by_client:
-                del self.fruit_top_by_client[client_id]
-
-            if client_id in self.clients_ready:
-                del self.clients_ready[client_id]
-
+    Each message type is validated against its expected field count before
+    being processed. Valid messages are acknowledged after successful
+    processing. Invalid or malformed messages are rejected with nack().
+    """
     def process_message(self, message, ack, nack):
-        #logging.info("Process message")
-        fields = message_protocol.internal.deserialize(message)
 
-        if len(fields) == 3:
-            self._process_data(*fields)
-        elif len(fields) == 2:
-            client_id = fields[0]
-            sum_id = fields[1]
-            self._process_sum_eof(client_id, sum_id)
+        try:
+            logging.info("Process message")
+            
+            fields = message_protocol.internal.deserialize(message)
+            msgtyp = InternalMsgType(fields[0])
 
-        ack()
+            if msgtyp == InternalMsgType.PROCESS_DATA:
 
-    def process_control_message(self, message, ack, nack):
-        fields = message_protocol.internal.deserialize(message)
-        msgtyp = InternalMsgType(fields[0])
-
-        if msgtyp == InternalMsgType.AGGREGATOR_READY:
-            agg_id = fields[1]
-            client_id = fields[2]
-
-            with self.lock:
-                if client_id in self.closed_clients:
-                    ack()
+                if len(fields) != SUM_DATA_MESSAGE_FIELD_COUNT:
+                    logging.error(f"Process data message expects {SUM_DATA_MESSAGE_FIELD_COUNT} fields but received {len(fields)}")
+                    nack()
                     return
+                self._process_data(*fields[1:])
 
-                if client_id not in self.clients_ready:
-                    self.clients_ready[client_id] = set()
+            elif msgtyp == InternalMsgType.CLIENT_EOF:
+                if len(fields) != SUM_EOF_MESSAGE_FIELD_COUNT:
+                    logging.error(f"Process EOF message expects {SUM_EOF_MESSAGE_FIELD_COUNT} fields but received {len(fields)}")
+                    nack()
+                    return
+                self._process_eof(*fields[1:])
 
-                self.clients_ready[client_id].add(agg_id)
-                current_count = len(self.clients_ready[client_id])
+            elif msgtyp == InternalMsgType.SUM_WORKER_SHUTDOWN:
+                if len(fields) != SUM_SHUTDOWN_MESSAGE_FIELD_COUNT:
+                    logging.error(f"Process EOF message expects {SUM_SHUTDOWN_MESSAGE_FIELD_COUNT} fields but received {len(fields)}")
+                    nack()
+                    return
+                self._handle_sum_shutdown(*fields[1:])
 
-                logging.info(
-                    f"Received control '{msgtyp.value}' from aggregation_{agg_id} "
-                    f"for client {client_id}. Count: {current_count}/{AGGREGATION_AMOUNT}"
-                )
+            ack()
+        except ValueError:
+            logging.error(f"Unknown message type received: {fields[0]}")
+            nack()
+        except Exception as e:
+            logging.exception(f"Error parsing message type: {e}")
+            nack()
 
-                if current_count == AGGREGATION_AMOUNT:
-                    self._send_top(client_id)
+    """
+    Handle the shutdown of a sum worker.
 
-                    owner = self._get_client_owner(client_id)
-                    if owner == ID:
-                        self._send_eof_to_join(client_id)
-
-        ack()
-
-    def _get_client_owner(self, client_id):
-        return int(hashlib.md5(client_id.encode("utf-8")).hexdigest(), 16) % AGGREGATION_AMOUNT
+    Any data already received from the disconnected worker is still considered
+    valid and remains part of the aggregation state. The shutdown only reduces
+    the number of active sum workers expected for future EOF coordination.
+    """
+    def _handle_sum_shutdown(self, sum_id):
+        logging.info(f"Shutdown received from sum_{sum_id}")
+        self.sum_workers -=1
 
     def start(self):
-        control_thread = threading.Thread(
-            target=lambda: self.control_input.start_consuming(
-                self.process_control_message
-            ),
-            daemon=True
-        )
-        control_thread.start()
-
         self.input_exchange.start_consuming(self.process_message)
-
 
 def main():
     logging.basicConfig(level=logging.INFO)
     aggregation_filter = AggregationFilter()
     aggregation_filter.start()
     return 0
-
 
 if __name__ == "__main__":
     main()
