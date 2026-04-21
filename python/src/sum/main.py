@@ -67,42 +67,25 @@ class SumFilter:
     """
     Gracefully handle SIGTERM shutdown requests.
 
-    The worker marks itself as closed, stops accepting new messages,
-    closes all RabbitMQ inputs and outputs, notifies aggregation workers
-    that this sum worker is disconnecting, and then releases remaining
-    output connections.
+    The worker marks itself as shutting down and stops consuming new
+    messages from both the data queue and the control exchange.
+
+    Pending aggregated data is flushed and downstream workers are notified
+    after the consumer loops exit.
     """
     def handle_sigterm(self, signum, frame):
         logging.warning("[SIGTERM] Received")
-
         self.shutdown = True
 
         try:
-            self.input_queue.close()
+            self.input_queue.stop_consuming()
         except Exception:
-            logging.exception("Error closing input queue")
-            pass
+            logging.exception("Error stopping input queue consumption")
 
         try:
-            self.control_input.close()
+            self.control_input.stop_consuming()
         except Exception:
-            logging.exception("Error closing control input")
-            pass
-
-        try:
-            for control_output in self.control_outputs:
-                control_output.close()
-        except Exception:
-            logging.exception("Error closing control outputs")
-            pass
-
-        self._notify_shutdown()
-
-        for data_output in self.data_outputs:
-            try:
-                data_output.close()
-            except Exception:
-                pass
+            logging.exception("Error stopping control input consumption")
 
     """
     Notify all aggregation workers that this sum worker became unavailable.
@@ -172,10 +155,46 @@ class SumFilter:
     input data messages from the queue.
     """
     def start(self):
-        control_thread = threading.Thread(target=lambda: self.control_input.start_consuming(self.process_control_message),daemon=True)
+        control_thread = threading.Thread(
+            target=lambda: self.control_input.start_consuming(self.process_control_message),
+            daemon=True
+        )
         control_thread.start()
 
-        self.input_queue.start_consuming(self.process_data_messsage)
+        try:
+            self.input_queue.start_consuming(self.process_data_messsage)
+        finally:
+            if self.shutdown:
+                with self.lock:
+                    pending_clients = list(self.amount_by_client.keys())
+
+                for client_id in pending_clients:
+                    self._dispatch_aggregated_data(client_id)
+                    self._close_client(client_id)
+
+                self._notify_shutdown()
+
+            try:
+                self.input_queue.close()
+            except Exception:
+                logging.exception("Error closing input queue")
+
+            try:
+                self.control_input.close()
+            except Exception:
+                logging.exception("Error closing control input")
+
+            for control_output in self.control_outputs:
+                try:
+                    control_output.close()
+                except Exception:
+                    logging.exception("Error closing control output")
+
+            for data_output in self.data_outputs:
+                try:
+                    data_output.close()
+                except Exception:
+                    logging.exception("Error closing data output")
 
     """
     Broadcast a control message to all sum workers.

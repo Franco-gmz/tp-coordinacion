@@ -50,18 +50,20 @@ class AggregationFilter:
     """
     Gracefully handle SIGTERM shutdown requests.
 
-    The worker marks itself as shutting down and stops consuming new messages
-    from the input exchange. Pending aggregated data will be flushed the next
-    time the message loop regains control.
+    The worker marks itself as shutting down and stops consuming new
+    messages from the input exchange.
+
+    Pending aggregated data will be flushed and forwarded downstream
+    after the consume loop exits.
     """
     def handle_sigterm(self, signum, frame):
         logging.warning("[SIGTERM] Received")
         self.shutdown = True
 
         try:
-            self.input_exchange.close()
+            self.input_exchange.stop_consuming()
         except Exception:
-            logging.exception("Error closing input exchange")
+            logging.exception("Error stopping input exchange consumption")
 
     """
     Notify the downstream join stage that this aggregation worker became
@@ -147,6 +149,8 @@ class AggregationFilter:
         self.output_queue.send(message_protocol.internal.serialize([InternalMsgType.CLIENT_EOF.value, client_id, ID]))
         if client_id in self.fruit_top_by_client:
             del self.fruit_top_by_client[client_id]
+        if client_id in self.eof_received:
+            del self.eof_received[client_id]
 
     """
     Process incoming messages received from sum workers.
@@ -156,8 +160,8 @@ class AggregationFilter:
     - CLIENT_EOF: notification that a sum worker finished sending data for a client
     - SUM_WORKER_SHUTDOWN: notification that a sum worker became unavailable
 
-    If the aggregation worker is shutting down, any pending partial data is
-    flushed downstream before notifying join about the shutdown.
+    If the worker is already shutting down, the current message is
+    requeued using nack() so it can be processed by another worker.
 
     Each message type is validated against its expected field count before
     being processed. Valid messages are acknowledged after successful
@@ -166,12 +170,8 @@ class AggregationFilter:
     def process_message(self, message, ack, nack):
 
         try:
-            if self.shutdown == True:
-                for client in self.fruit_top_by_client:
-                    self._send_aggregated_data(client)
-                self._notify_shutdown()
-                self.output_queue.close()
-                logging.info("Flushed data. Shutting down...")
+            if self.shutdown:
+                nack()
                 return
 
             logging.info("Process message")
@@ -221,7 +221,28 @@ class AggregationFilter:
         self.sum_workers -=1
 
     def start(self):
-        self.input_exchange.start_consuming(self.process_message)
+        try:
+            self.input_exchange.start_consuming(self.process_message)
+        finally:
+            if self.shutdown:
+                logging.info("Flushing data before shutdown...")
+
+                for client in list(self.fruit_top_by_client.keys()):
+                    self._send_aggregated_data(client)
+
+                self._notify_shutdown()
+
+                logging.info("Shutdown completed")
+
+            try:
+                self.input_exchange.close()
+            except Exception:
+                logging.exception("Error closing input exchange")
+
+            try:
+                self.output_queue.close()
+            except Exception:
+                logging.exception("Error closing output queue")
 
 def main():
     logging.basicConfig(level=logging.INFO)
