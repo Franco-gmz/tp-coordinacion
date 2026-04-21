@@ -79,3 +79,117 @@ Al momento de la evaluación y ejecución de las pruebas se **descartarán** o *
 - La implementación del protocolo de comunicación externo y `FruitItem`.
 
 Redactar un breve informe explicando el modo en que se coordinan las instancias de Sum y Aggregation, así como el modo en el que el sistema escala respecto a los clientes y a la cantidad de controles.
+
+## Resolución
+
+Se implementó la sincronización de las instancias utilizando el middleware diseñado en el trabajo previo basado en RabbitMQ. A continuación se detallan los detalles de implementación asociados a las instancias de `sum`, `agg` y `join`.
+
+### Consumo y Confirmación Manual
+
+Se utilizó `auto_ack=False` en todos los consumidores para garantizar que los mensajes solo sean eliminados de RabbitMQ una vez procesados correctamente.
+
+El callback interno expone dos funciones auxiliares:
+
+* `ack()`: confirma el procesamiento correcto del mensaje.
+* `nack()`: rechaza el mensaje y lo reencola.
+
+Esto permite que, si un worker falla o se apaga antes de terminar el procesamiento, RabbitMQ vuelva a entregar el mensaje a otro consumidor.
+
+### Shutdown Seguro
+
+Se implementó una lógica de apagado seguro para evitar pérdida de mensajes.
+
+El comportamiento esperado es:
+
+1. Detener el loop de consumo usando `stop_consuming()`.
+2. Permitir finalizar el callback actualmente en ejecución.
+3. Hacer `ack` si el mensaje terminó correctamente.
+4. Hacer `nack(requeue=True)` si el mensaje no pudo completarse.
+5. Flushear datos pendientes en memoria.
+6. Notificar shutdown a los workers downstream.
+7. Cerrar canales y conexiones.
+
+Gracias a `prefetch_count=1`, cada worker puede tener como máximo un único mensaje pendiente de confirmación.
+
+Si un worker se apaga sin confirmar ese mensaje, RabbitMQ lo reencola automáticamente en la misma cola para que otro worker pueda procesarlo.
+
+### Coordinación
+
+Además del middleware, se implementó la lógica de coordinación entre workers para manejar mensajes de control, EOFs y shutdowns.
+
+Entre las principales resoluciones se incluyen:
+
+* Tracking de EOF recibidos por cliente.
+* Espera de EOF de todos los workers antes de emitir el resultado final.
+* Cálculo y envío del top final por cliente.
+* Liberación de memoria eliminando estructuras internas una vez finalizado un cliente.
+* Manejo de shutdowns de workers de sum y agregación.
+* Reducción de la cantidad de workers activos restantes en caso de una caída.
+
+### Sum Filter
+
+El componente Sum fue implementado para recibir datos parciales, agruparlos por cliente y distribuirlos hacia los workers de agregación.
+
+Entre las principales responsabilidades implementadas se encuentran:
+
+* Consumo de mensajes desde la cola de entrada.
+* Parseo y deserialización de mensajes internos.
+* Distribución determinística de datos hacia los workers de agregación utilizando un hash basado en cliente y fruta.
+* Envío de datos parciales a exchanges de agregación.
+* Manejo de EOF por cliente.
+* Broadcast de EOF a los workers correspondientes.
+* Tracking de clientes cerrados para evitar reprocesamiento.
+* Recepción y propagación de mensajes de shutdown.
+* Flush de datos pendientes antes del cierre definitivo.
+
+También se implementó coordinación entre Sum y Aggregation utilizando mensajes de control para notificar shutdowns y permitir que los workers de agregación ajusten la cantidad de sum workers activos esperados.
+
+### Aggregation Filter
+
+El componente Aggregation fue implementado para recibir datos parciales provenientes de los workers Sum y acumular resultados intermedios por cliente.
+
+Las principales resoluciones implementadas fueron:
+
+* Recepción de mensajes de tipo `PROCESS_DATA`.
+* Acumulación de cantidades por fruta y cliente.
+* Mantenimiento de estructuras internas por cliente.
+* Recepción de EOF por cliente desde múltiples workers Sum.
+* Conteo de EOF recibidos para determinar cuándo un cliente terminó completamente.
+* Cálculo del top parcial de frutas por cliente.
+* Envío de resultados parciales hacia Join.
+* Envío de EOF hacia Join una vez finalizado un cliente.
+* Manejo de mensajes de shutdown.
+* Limpieza de memoria de clientes finalizados.
+
+Además, se implementó la lógica necesaria para esperar EOF de todos los workers Sum antes de considerar finalizado un cliente.
+
+### Join
+
+El componente Join fue implementado para consolidar los resultados parciales provenientes de los workers de agregación y emitir el resultado final por cliente.
+
+Entre las principales funcionalidades implementadas se encuentran:
+
+* Recepción de resultados parciales por cliente.
+* Acumulación de cantidades por fruta provenientes de múltiples aggregators.
+* Mantenimiento de estructuras internas por cliente.
+* Recepción de EOF desde cada worker de agregación.
+* Tracking de EOF recibidos por cliente.
+* Espera hasta recibir EOF de todos los aggregators antes de finalizar un cliente.
+* Ordenamiento final de frutas por cantidad.
+* Obtención del top final limitado por `TOP_SIZE`.
+* Envío del resultado final a la cola de salida.
+* Liberación de memoria eliminando los datos del cliente finalizado.
+* Manejo de shutdown de aggregators y reducción de workers activos.
+
+### Resultado
+
+La implementación final permite:
+
+* Procesar mensajes de forma confiable.
+* Evitar pérdida de mensajes ante errores o caídas.
+* Redistribuir mensajes no confirmados.
+* Cerrar conexiones correctamente.
+* Coordinar workers y resultados finales.
+* Manejar EOFs y shutdowns de forma consistente.
+* Sincronizar Sum, Aggregation y Join correctamente.
+* Cumplir con todas las pruebas provistas por la cátedra.
