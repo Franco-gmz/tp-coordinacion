@@ -236,7 +236,7 @@ hash(client_id + fruit) % AGGREGATION_AMOUNT
 
 ## Limitaciones Conocidas
 
-> **Si un aggregator se cae, el sistema NO redistribuye correctamente la carga.**
+ **Si un aggregator se cae, el sistema NO redistribuye correctamente la carga.**
 
 ### Problema
 
@@ -384,7 +384,7 @@ Punto de entrada principal.
 
 ## Limitaciones Conocidas
 
-> **Dependencia fuerte en la cantidad de SUM activos**
+ **Dependencia fuerte en la cantidad de SUM activos**
 
 ### Problema
 
@@ -513,7 +513,7 @@ Punto de entrada principal.
 
 ## Limitaciones Conocidas
 
-> ⚠️ **Dependencia de la correcta señalización de EOF desde los aggregators**
+ **Dependencia de la correcta señalización de EOF desde los aggregators**
 
 ### Problema
 
