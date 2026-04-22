@@ -182,76 +182,42 @@ El **Sum Filter** es un componente intermedio dentro del pipeline distribuido cu
 
 ---
 
-## Métodos Principales
+### Métodos Principales
 
-### `process_message(self, message, ack, nack)`
+#### `process_data_messsage(self, message, ack, nack)` / `process_control_message(self, message, ack, nack)`
 
-Punto de entrada principal.
+Puntos de entrada del worker.
 
-**Responsabilidades:**
-- Deserializar el mensaje.
-- Determinar el tipo.
-- Delegar al método correspondiente.
-- Manejar errores de formato.
-- Coordinar el shutdown.
+- Deserializan los mensajes recibidos.
+- Determinan su tipo.
+- Delegan el procesamiento a los métodos correspondientes.
 
 ---
 
-### `_process_data(...)`
+#### `_process_data(self, client_id, fruit, amount)`
 
 Procesa mensajes de datos.
 
-**Qué hace:**
-- Recibe `(client_id, fruit, amount)`.
-- Acumula en `amount_by_client`.
-- Suma incremental por fruta.
+- Acumula cantidades por cliente y fruta.
 
 ---
 
-### `_process_eof(...)`
-
-Maneja fin de datos de un cliente.
-
-**Qué hace:**
-- Detecta que no llegarán más datos para un cliente.
-- Dispara el envío de datos agregados.
-- Marca al cliente como cerrado.
-
----
-
-### `_dispatch_aggregated_data(self, client_id)`
+#### `_dispatch_aggregated_data(self, client_id)`
 
 Envía los datos agregados a los aggregators.
 
-**Qué hace:**
-- Itera sobre las frutas del cliente.
-- Calcula a qué `agg` corresponde cada fruta:
-
-  ```python
-  agg_id = self._get_agg_id(client_id, fruit)
-  ```
-
-- Serializa y envía el mensaje al aggregator.
-
-**Formato enviado:**
-
-```
-(PROCESS_DATA, client_id, fruit, amount)
-```
+- Determina el `agg` destino mediante `_get_agg_id`.
+- Serializa y envía los datos.
 
 ---
 
-### `_get_agg_id(client_id, fruit)`
+#### `_get_agg_id(self, client_id, fruit)`
 
 Determina a qué aggregator enviar los datos.
 
-**Qué hace:**
-- Aplica una función de distribución (hash / partición).
-- Garantiza consistencia en el routing.
-
 ---
 
-### `_notify_shutdown()`
+#### `_notify_shutdown(self)`
 
 Notifica a otros nodos que este worker finalizó.
 
@@ -369,51 +335,38 @@ El componente **Aggregation (agg)** es responsable de recibir los datos parciale
 
 ## Métodos Principales
 
-### `process_message(self, message, ack, nack)`
+#### `process_message(self, message, ack, nack)`
 
 Punto de entrada principal.
 
 - Deserializa el mensaje.
-- Determina el tipo:
-  - `PROCESS_DATA`
-  - `CLIENT_EOF`
-  - `SUM_WORKER_SHUTDOWN`
-- Delega al método correspondiente.
+- Determina su tipo.
+- Delega el procesamiento.
 
 ---
 
-### `_process_data(client_id, fruit, amount)`
+#### `_process_data(self, client_id, fruit, amount)`
 
-- Acumula el valor en `amount_by_client`.
-- Suma incremental por fruta.
-
----
-
-### `_process_eof(client_id)`
-
-- Incrementa el contador de EOF para ese cliente.
-- Si recibió EOF de todos los `sum`:
-  - dispara `_dispatch_final_data(client_id)`.
+- Acumula datos recibidos.
 
 ---
 
-### `_dispatch_final_data(client_id)`
+#### `_process_eof(self, client_id, sum_id)`
 
-- Itera sobre todas las frutas del cliente.
-- Envía los resultados finales downstream.
-
-Formato:
-
-```
-(client_id, fruit, total_amount)
-```
+- Registra EOF por `sum`.
+- Determina cuándo un cliente está completo.
 
 ---
 
-### `_process_sum_shutdown(sum_id)`
+#### `_send_aggregated_data(self, client_id)`
 
-- Detecta que un `sum` dejó de existir.
-- Ajusta el total esperado de EOF.
+- Envía resultados agregados hacia `join`.
+
+---
+
+#### `_handle_sum_shutdown(self, sum_id)`
+
+- Maneja la caída de un worker `sum`.
 
 ---
 
@@ -517,51 +470,33 @@ El componente **Join** es la etapa final del pipeline. Su responsabilidad es **r
 
 ## Métodos Principales
 
-### `process_message(self, message, ack, nack)`
+#### `process_messsage(self, message, ack, nack)`
 
 Punto de entrada principal.
 
 - Deserializa el mensaje.
-- Determina el tipo:
-  - `PROCESS_DATA`
-  - `CLIENT_EOF`
-  - `AGG_WORKER_SHUTDOWN` (si aplica)
-- Delega al método correspondiente.
+- Determina el tipo.
+- Delega el procesamiento.
 
 ---
 
-### `_process_data(client_id, fruit, amount)`
+#### `_process_partial_top(self, client_id, fruit_top)`
 
-- Inserta o actualiza el valor en `results_by_client`.
-- En esta etapa normalmente **no hay suma adicional**, ya que el dato ya viene agregado desde `agg`.
-
----
-
-### `_process_eof(client_id)`
-
-- Incrementa el contador de EOF para ese cliente.
-- Si recibió EOF de todos los `agg`:
-  - dispara `_dispatch_final_result(client_id)`.
+- Recibe datos parciales desde `agg`.
+- Construye el resultado final.
 
 ---
 
-### `_dispatch_final_result(client_id)`
+#### `_process_eof(self, client_id, agg_id)`
 
-- Construye el resultado final del cliente.
-- Emite la salida (por consola, archivo o siguiente etapa).
-
-Formato conceptual:
-
-```
-client_id -> { fruit: total_amount }
-```
+- Registra EOF por `agg`.
+- Determina cuándo el cliente está completo.
 
 ---
 
-### `_process_agg_shutdown(agg_id)`
+#### `_handle_agg_shutdown(self, agg_id)`
 
-- Ajusta la cantidad esperada de EOF.
-- Permite evitar bloqueos si un `agg` deja de enviar datos.
+- Maneja la caída de un worker `agg`.
 
 ---
 
