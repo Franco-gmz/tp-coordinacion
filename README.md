@@ -128,68 +128,507 @@ Entre las principales resoluciones se incluyen:
 
 ### Sum Filter
 
-El componente Sum fue implementado para recibir datos parciales, agruparlos por cliente y distribuirlos hacia los workers de agregación.
+El **Sum Filter** es un componente intermedio dentro del pipeline distribuido cuya responsabilidad principal es **recibir datos parciales por cliente, agregarlos localmente y distribuirlos hacia los Aggregators (agg)** correspondientes.
 
-Entre las principales responsabilidades implementadas se encuentran:
+---
 
-* Consumo de mensajes desde la cola de entrada.
-* Parseo y deserialización de mensajes internos.
-* Distribución determinística de datos hacia los workers de agregación utilizando un hash basado en cliente y fruta.
-* Envío de datos parciales a exchanges de agregación.
-* Manejo de EOF por cliente.
-* Broadcast de EOF a los workers correspondientes.
-* Tracking de clientes cerrados para evitar reprocesamiento.
-* Recepción y propagación de mensajes de shutdown.
-* Flush de datos pendientes antes del cierre definitivo.
+## Responsabilidad General
 
-También se implementó coordinación entre Sum y Aggregation utilizando mensajes de control para notificar shutdowns y permitir que los workers de agregación ajusten la cantidad de sum workers activos esperados.
+- Consumir mensajes desde una cola de entrada.
+- Agrupar cantidades por **cliente y tipo de fruta**.
+- Determinar dinámicamente a qué **Aggregator (agg)** enviar cada resultado.
+- Manejar eventos de finalización por cliente (**EOF**).
+- Coordinar el cierre del sistema de forma ordenada.
 
-### Aggregation Filter
+---
 
-El componente Aggregation fue implementado para recibir datos parciales provenientes de los workers Sum y acumular resultados intermedios por cliente.
+## Flujo General
 
-Las principales resoluciones implementadas fueron:
+1. **Recepción de mensajes**
+   - Se reciben mensajes desde RabbitMQ.
+   - Se identifican por tipo (`PROCESS_DATA`, `CLIENT_EOF`, etc.).
 
-* Recepción de mensajes de tipo `PROCESS_DATA`.
-* Acumulación de cantidades por fruta y cliente.
-* Mantenimiento de estructuras internas por cliente.
-* Recepción de EOF por cliente desde múltiples workers Sum.
-* Conteo de EOF recibidos para determinar cuándo un cliente terminó completamente.
-* Cálculo del top parcial de frutas por cliente.
-* Envío de resultados parciales hacia Join.
-* Envío de EOF hacia Join una vez finalizado un cliente.
-* Manejo de mensajes de shutdown.
-* Limpieza de memoria de clientes finalizados.
+2. **Procesamiento**
+   - Se acumulan cantidades por cliente y fruta.
+   - Se mantiene estado interno de agregación.
 
-Además, se implementó la lógica necesaria para esperar EOF de todos los workers Sum antes de considerar finalizado un cliente.
+3. **Distribución**
+   - Cuando corresponde (por ejemplo al recibir EOF), se envían los datos agregados a los `agg`.
+
+4. **Cierre**
+   - Se notifican eventos de finalización a otros nodos.
+   - Se liberan recursos.
+
+---
+
+## Estructuras Clave
+
+- `amount_by_client`  
+  Diccionario que agrupa resultados:
+
+  ```python
+  {
+    client_id: {
+        fruit: FruitItem(amount)
+    }
+  }
+  ```
+
+- `data_outputs`  
+  Mapeo de conexiones hacia los aggregators.
+
+- `current_aggs`  
+  Cantidad de aggregators activos.
+
+---
+
+## Métodos Principales
+
+### `process_message(self, message, ack, nack)`
+
+Punto de entrada principal.
+
+**Responsabilidades:**
+- Deserializar el mensaje.
+- Determinar el tipo.
+- Delegar al método correspondiente.
+- Manejar errores de formato.
+- Coordinar el shutdown.
+
+---
+
+### `_process_data(...)`
+
+Procesa mensajes de datos.
+
+**Qué hace:**
+- Recibe `(client_id, fruit, amount)`.
+- Acumula en `amount_by_client`.
+- Suma incremental por fruta.
+
+---
+
+### `_process_eof(...)`
+
+Maneja fin de datos de un cliente.
+
+**Qué hace:**
+- Detecta que no llegarán más datos para un cliente.
+- Dispara el envío de datos agregados.
+- Marca al cliente como cerrado.
+
+---
+
+### `_dispatch_aggregated_data(self, client_id)`
+
+Envía los datos agregados a los aggregators.
+
+**Qué hace:**
+- Itera sobre las frutas del cliente.
+- Calcula a qué `agg` corresponde cada fruta:
+
+  ```python
+  agg_id = self._get_agg_id(client_id, fruit)
+  ```
+
+- Serializa y envía el mensaje al aggregator.
+
+**Formato enviado:**
+
+```
+(PROCESS_DATA, client_id, fruit, amount)
+```
+
+---
+
+### `_get_agg_id(client_id, fruit)`
+
+Determina a qué aggregator enviar los datos.
+
+**Qué hace:**
+- Aplica una función de distribución (hash / partición).
+- Garantiza consistencia en el routing.
+
+---
+
+### `_notify_shutdown()`
+
+Notifica a otros nodos que este worker finalizó.
+
+---
+
+## Distribución hacia Aggregators
+
+El `Sum Filter` no envía todos los datos a todos los aggregators.
+
+En cambio:
+- Divide el universo de datos.
+- Cada `(cliente, fruta)` es asignado a un `agg` específico.
+- Esto permite paralelismo y escalabilidad.
+
+La asignación se realiza típicamente mediante:
+
+```python
+hash(client_id + fruit) % AGGREGATION_AMOUNT
+```
+
+---
+
+## Limitaciones Conocidas
+
+> **Si un aggregator se cae, el sistema NO redistribuye correctamente la carga.**
+
+### Problema
+
+- Se detecta el fallo (por excepción al enviar).
+- Se elimina el output del `agg`.
+- Pero:
+  - No se decrementa correctamente la cantidad de aggregators activos.
+  - No se recalcula el routing (`_get_agg_id`).
+  - No se reenvían los datos pendientes a otros aggregators.
+
+### Impacto
+
+- Posible pérdida de datos.
+- Distribución inconsistente.
+- Resultados incompletos.
+
+### Estado
+
+- Problema identificado.
+- No implementado por falta de tiempo.
+
+### Mejora Pendiente
+
+- Recalcular dinámicamente el conjunto de aggregators activos.
+- Rebalancear el hash/routing.
+- Reintentar envíos fallidos.
+
+---
+
+## Conclusión
+
+El **Sum Filter** actúa como una capa de **pre-agregación y distribución inteligente**, reduciendo volumen de datos y permitiendo paralelismo en los aggregators.
+
+Si bien cumple correctamente su función en condiciones normales, **la tolerancia a fallos de aggregators es una mejora clave pendiente**.
+
+### Aggregation (Agg)
+
+El componente **Aggregation (agg)** es responsable de recibir los datos parciales provenientes de los `sum`, realizar la **agregación final** y emitir los resultados consolidados por cliente y fruta.
+
+---
+
+## Responsabilidad General
+
+- Recibir datos agregados parciales desde los `sum`.
+- Consolidar resultados finales por **cliente y fruta**.
+- Detectar cuándo un cliente está completamente procesado.
+- Emitir el resultado final downstream (por ejemplo hacia `join`).
+- Detectar la finalización de clientes a partir de señales (`CLIENT_EOF`) recibidas desde los workers `sum`.
+- Sincronizar la finalización por cliente en base a los EOF recibidos.
+- Ajustar su lógica interna ante la caída de workers `sum` (por ejemplo, mediante `SUM_WORKER_SHUTDOWN`).
+
+---
+
+## Flujo General
+
+1. **Recepción de datos**
+   - Recibe mensajes `PROCESS_DATA` desde múltiples `sum`.
+
+2. **Acumulación**
+   - Suma los valores por `(client_id, fruit)`.
+
+3. **Recepción de EOF**
+   - Cada `sum` envía un `CLIENT_EOF` cuando termina un cliente.
+
+4. **Finalización**
+   - Cuando el `agg` recibe EOF de todos los `sum` para un cliente:
+     - considera el cliente completo;
+     - emite el resultado final.
+
+---
+
+## Estructuras Clave
+
+- `amount_by_client`
+  ```python
+  {
+    client_id: {
+        fruit: total_amount
+    }
+  }
+  ```
+
+- `eof_by_client`
+  - Lleva cuenta de cuántos `sum` enviaron EOF por cliente.
+
+- `sum_count`
+  - Cantidad esperada de `sum`.
+
+---
+
+## Métodos Principales
+
+### `process_message(self, message, ack, nack)`
+
+Punto de entrada principal.
+
+- Deserializa el mensaje.
+- Determina el tipo:
+  - `PROCESS_DATA`
+  - `CLIENT_EOF`
+  - `SUM_WORKER_SHUTDOWN`
+- Delega al método correspondiente.
+
+---
+
+### `_process_data(client_id, fruit, amount)`
+
+- Acumula el valor en `amount_by_client`.
+- Suma incremental por fruta.
+
+---
+
+### `_process_eof(client_id)`
+
+- Incrementa el contador de EOF para ese cliente.
+- Si recibió EOF de todos los `sum`:
+  - dispara `_dispatch_final_data(client_id)`.
+
+---
+
+### `_dispatch_final_data(client_id)`
+
+- Itera sobre todas las frutas del cliente.
+- Envía los resultados finales downstream.
+
+Formato:
+
+```
+(client_id, fruit, total_amount)
+```
+
+---
+
+### `_process_sum_shutdown(sum_id)`
+
+- Detecta que un `sum` dejó de existir.
+- Ajusta el total esperado de EOF.
+
+---
+
+## Comportamiento Distribuido
+
+- Cada `agg` recibe solo un subconjunto de datos.
+- Esto se define por el hashing realizado en `sum`.
+- No todos los `agg` ven todos los clientes completos.
+- Cada `agg` produce resultados parciales finales por partición.
+
+---
+
+## Manejo de Errores
+
+- Si hay errores en parsing → `nack`.
+- Si hay problemas en envío downstream → log + retry implícito (según middleware).
+
+---
+
+## Limitaciones Conocidas
+
+> **Dependencia fuerte en la cantidad de SUM activos**
+
+### Problema
+
+- El `agg` espera recibir EOF de todos los `sum`.
+- Si un `sum` falla y no se notifica correctamente:
+  - el cliente puede quedar bloqueado indefinidamente.
+- Se requiere implementar o definir algún tipo de timeout para dejar de considerar al `sum` demorado.
+
+### Impacto
+
+- Resultados nunca emitidos.
+- Deadlock lógico por cliente.
+
+### Mejora Pendiente
+
+- Implementar timeout por cliente.
+- Manejo robusto de fallos de `sum`.
+- Reconciliación dinámica de workers activos.
+
+---
+
+## Conclusión
+
+El componente **Aggregation** realiza la agregación final distribuida, asegurando que los datos provenientes de múltiples `sum` se consoliden correctamente.
+
+Es clave para la correcta finalización por cliente, pero actualmente **requiere mejoras en tolerancia a fallos** para ser completamente robusto.
 
 ### Join
 
-El componente Join fue implementado para consolidar los resultados parciales provenientes de los workers de agregación y emitir el resultado final por cliente.
+El componente **Join** es la etapa final del pipeline. Su responsabilidad es **reunir (join) los resultados provenientes de los Aggregators (`agg`) y producir la salida final por cliente**.
 
-Entre las principales funcionalidades implementadas se encuentran:
+---
 
-* Recepción de resultados parciales por cliente.
-* Acumulación de cantidades por fruta provenientes de múltiples aggregators.
-* Mantenimiento de estructuras internas por cliente.
-* Recepción de EOF desde cada worker de agregación.
-* Tracking de EOF recibidos por cliente.
-* Espera hasta recibir EOF de todos los aggregators antes de finalizar un cliente.
-* Ordenamiento final de frutas por cantidad.
-* Obtención del top final limitado por `TOP_SIZE`.
-* Envío del resultado final a la cola de salida.
-* Liberación de memoria eliminando los datos del cliente finalizado.
-* Manejo de shutdown de aggregators y reducción de workers activos.
+## Responsabilidad General
+
+- Recibir resultados finales parciales desde múltiples `agg`.
+- Combinar esos resultados por **cliente**.
+- Detectar cuándo un cliente está completamente procesado.
+- Emitir el resultado final consolidado.
+
+---
+
+## Flujo General
+
+1. **Recepción de datos**
+   - Recibe mensajes con resultados finales desde los `agg`.
+
+2. **Acumulación / Unión**
+   - Integra los datos por `client_id`.
+
+3. **Recepción de EOF**
+   - Cada `agg` envía `CLIENT_EOF` por cliente.
+
+4. **Finalización**
+   - Cuando recibe EOF de todos los `agg` para un cliente:
+     - considera el cliente completo;
+     - emite el resultado final.
+
+---
+
+## Estructuras Clave
+
+- `results_by_client`
+  ```python
+  {
+    client_id: {
+        fruit: total_amount
+    }
+  }
+  ```
+
+- `eof_by_client`
+  - Contador de EOF recibidos por cliente.
+
+- `agg_count`
+  - Cantidad esperada de aggregators.
+
+---
+
+## Métodos Principales
+
+### `process_message(self, message, ack, nack)`
+
+Punto de entrada principal.
+
+- Deserializa el mensaje.
+- Determina el tipo:
+  - `PROCESS_DATA`
+  - `CLIENT_EOF`
+  - `AGG_WORKER_SHUTDOWN` (si aplica)
+- Delega al método correspondiente.
+
+---
+
+### `_process_data(client_id, fruit, amount)`
+
+- Inserta o actualiza el valor en `results_by_client`.
+- En esta etapa normalmente **no hay suma adicional**, ya que el dato ya viene agregado desde `agg`.
+
+---
+
+### `_process_eof(client_id)`
+
+- Incrementa el contador de EOF para ese cliente.
+- Si recibió EOF de todos los `agg`:
+  - dispara `_dispatch_final_result(client_id)`.
+
+---
+
+### `_dispatch_final_result(client_id)`
+
+- Construye el resultado final del cliente.
+- Emite la salida (por consola, archivo o siguiente etapa).
+
+Formato conceptual:
+
+```
+client_id -> { fruit: total_amount }
+```
+
+---
+
+### `_process_agg_shutdown(agg_id)`
+
+- Ajusta la cantidad esperada de EOF.
+- Permite evitar bloqueos si un `agg` deja de enviar datos.
+
+---
+
+## Comportamiento Distribuido
+
+- Cada `agg` procesa solo una partición del dataset.
+- El `join` reconstruye la visión completa del cliente.
+- Actúa como punto de **sincronización final**.
+
+---
+
+## Manejo de Errores
+
+- Mensajes mal formados → `nack`.
+- Datos inconsistentes → log + descarte o tolerancia según implementación.
+
+---
+
+## Limitaciones Conocidas
+
+> ⚠️ **Dependencia de la correcta señalización de EOF desde los aggregators**
+
+### Problema
+
+- El `join` depende de recibir EOF de todos los `agg`.
+- Si un `agg` falla y no notifica:
+  - el cliente puede no cerrarse nunca.
+
+### Impacto
+
+- Resultados finales incompletos.
+- Clientes "colgados".
+
+### Mejora Pendiente
+
+- Implementar timeouts por cliente.
+- Detección automática de `agg` caídos.
+- Finalización resiliente.
+
+---
+
+## Conclusión
+
+El **Join** es el último paso del pipeline distribuido, encargado de consolidar completamente los datos por cliente.
+
+Cumple un rol crítico de sincronización, pero actualmente **depende fuertemente de señales de EOF correctas**, lo que lo hace sensible a fallos en etapas previas.
 
 ### Resultado
 
-La implementación final permite:
+La implementación desarrollada permite construir un pipeline distribuido basado en middlewares orientados a mensajes, compuesto por las etapas `Sum`, `Aggregation` y `Join`, logrando:
 
-* Procesar mensajes de forma confiable.
-* Evitar pérdida de mensajes ante errores o caídas.
-* Redistribuir mensajes no confirmados.
-* Cerrar conexiones correctamente.
-* Coordinar workers y resultados finales.
-* Manejar EOFs y shutdowns de forma consistente.
-* Sincronizar Sum, Aggregation y Join correctamente.
-* Cumplir con todas las pruebas provistas por la cátedra.
+* Procesar y distribuir mensajes de forma desacoplada entre múltiples workers.
+* Realizar agregación parcial por cliente y tipo de fruta en la etapa `Sum`.
+* Consolidar resultados intermedios en la etapa `Aggregation`, respetando la partición de datos.
+* Integrar los resultados finales por cliente en la etapa `Join`.
+* Coordinar el procesamiento mediante mensajes de control, incluyendo señales de `CLIENT_EOF` y eventos de shutdown.
+* Mantener un comportamiento consistente y sincronizado entre las distintas etapas del sistema en condiciones normales de ejecución.
+* Gestionar el cierre ordenado de consumidores y conexiones al middleware.
+* Cumplir satisfactoriamente con las pruebas provistas por la cátedra.
+
+### Limitaciones
+
+Si bien la solución cumple con los requerimientos funcionales esperados, se identificaron las siguientes limitaciones en términos de tolerancia a fallos y robustez:
+
+* Ante la caída de un worker `Aggregation`, la etapa `Sum` no recalcula dinámicamente el conjunto de aggregators activos, lo que puede derivar en pérdida de datos, resultados incompletos y/o bloqueos.
+* La etapa `Aggregation` depende de recibir correctamente los mensajes `CLIENT_EOF` de todos los workers `Sum` para poder determinar la finalización de un cliente.
+* La etapa `Join` depende de recibir los `CLIENT_EOF` de todos los workers `Aggregation` esperados para emitir el resultado final consolidado.
+* No se implementaron mecanismos de reintento, rebalanceo dinámico ni timeouts por cliente, lo que limita la capacidad del sistema para recuperarse automáticamente ante fallos parciales.
+
+Estas limitaciones fueron identificadas durante el desarrollo y se consideran oportunidades de mejora para una versión futura del trabajo.
