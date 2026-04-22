@@ -173,13 +173,7 @@ El **Sum Filter** es un componente intermedio dentro del pipeline distribuido cu
     }
   }
   ```
-
-- `data_outputs`  
-  Mapeo de conexiones hacia los aggregators.
-
-- `current_aggs`  
-  Cantidad de aggregators activos.
-
+  
 ---
 
 ### Métodos Principales
@@ -219,7 +213,7 @@ Determina a qué aggregator enviar los datos.
 
 #### `_notify_shutdown(self)`
 
-Notifica a otros nodos que este worker finalizó.
+Notifica a otros nodos que este worker se apagará.
 
 ---
 
@@ -278,6 +272,8 @@ El **Sum Filter** actúa como una capa de **pre-agregación y distribución inte
 
 Si bien cumple correctamente su función en condiciones normales, **la tolerancia a fallos de aggregators es una mejora clave pendiente**.
 
+---
+
 ### Aggregation (Agg)
 
 El componente **Aggregation (agg)** es responsable de recibir los datos parciales provenientes de los `sum`, realizar la **agregación final** y emitir los resultados consolidados por cliente y fruta.
@@ -316,7 +312,7 @@ El componente **Aggregation (agg)** es responsable de recibir los datos parciale
 
 ## Estructuras Clave
 
-- `amount_by_client`
+- `fruit_top_by_client`
   ```python
   {
     client_id: {
@@ -325,10 +321,10 @@ El componente **Aggregation (agg)** es responsable de recibir los datos parciale
   }
   ```
 
-- `eof_by_client`
+- `eof_received`
   - Lleva cuenta de cuántos `sum` enviaron EOF por cliente.
 
-- `sum_count`
+- `sum_workers`
   - Cantidad esperada de `sum`.
 
 ---
